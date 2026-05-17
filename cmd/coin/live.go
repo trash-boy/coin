@@ -30,7 +30,6 @@ type LiveState struct {
 	LastSignalTime  time.Time `json:"last_signal_time"`
 	DailyDate       string    `json:"daily_date"`
 	DailyStartEquit float64   `json:"daily_start_equity"`
-	PeakEquity      float64   `json:"peak_equity"`
 	Halted          bool      `json:"halted"`
 	HaltReason      string    `json:"halt_reason"`
 }
@@ -111,7 +110,7 @@ func runLive(args []string) {
 		next := nextCloseTime(time.Now().UTC(), dur).Add(5 * time.Second)
 		sleep := time.Until(next)
 		if sleep > 0 {
-			fmt.Printf("[wait] next eval at %s CST (in %v)\n", next.In(displayLocation()).Format("2006-01-02 15:04:05"), sleep.Round(time.Second))
+			fmt.Printf("[wait] next eval at %s UTC (in %v)\n", next.UTC().Format("15:04:05"), sleep.Round(time.Second))
 			if !sleepWithCancel(ctx, sleep) {
 				return
 			}
@@ -148,9 +147,6 @@ func liveCycle(ctx context.Context, c *binance.FuturesClient, symbol, interval s
 		state.Halted = false
 		state.HaltReason = ""
 	}
-	if state.PeakEquity <= 0 || equity > state.PeakEquity {
-		state.PeakEquity = equity
-	}
 	if state.DailyStartEquit > 0 {
 		drawdown := (state.DailyStartEquit - equity) / state.DailyStartEquit * 100
 		if drawdown >= maxDailyLossPct {
@@ -158,17 +154,10 @@ func liveCycle(ctx context.Context, c *binance.FuturesClient, symbol, interval s
 			state.HaltReason = fmt.Sprintf("daily DD %.2f%% >= %.2f%%", drawdown, maxDailyLossPct)
 		}
 	}
-	if state.PeakEquity > 0 {
-		drawdown := (state.PeakEquity - equity) / state.PeakEquity
-		if drawdown >= cfg.MaxDrawdown {
-			state.Halted = true
-			state.HaltReason = fmt.Sprintf("max DD %.2f%% >= %.2f%%", drawdown*100, cfg.MaxDrawdown*100)
-		}
-	}
 	saveLiveState(statePath, state)
 
 	fmt.Printf("\n[cycle %s] equity=%.4f USDT  available=%.4f  uPnL=%.4f  dailyStart=%.4f  halted=%v\n",
-		time.Now().In(displayLocation()).Format("2006-01-02 15:04:05 CST"),
+		time.Now().UTC().Format("2006-01-02 15:04:05Z"),
 		equity, balance.AvailableBalance, balance.CrossUnPnL, state.DailyStartEquit, state.Halted)
 
 	end := time.Now().UTC()
@@ -198,54 +187,8 @@ func liveCycle(ctx context.Context, c *binance.FuturesClient, symbol, interval s
 
 	if state.Halted {
 		fmt.Println("[skip] halted by kill-switch:", state.HaltReason)
-		if state.HasPosition {
-			pos := binance.Position{
-				Symbol:      strings.ToUpper(symbol),
-				PositionAmt: state.Quantity,
-				EntryPrice:  state.EntryPrice,
-			}
-			if state.Side == string(strategy.Short) {
-				pos.PositionAmt = -state.Quantity
-			}
-			if closeExchangePosition(ctx, c, symbol, pos, live, state.HaltReason) {
-				state.HasPosition = false
-				state.Side = ""
-				state.Quantity = 0
-				state.EntryPrice = 0
-				state.StopLoss = 0
-			}
-		}
 		saveLiveState(statePath, state)
 		return nil
-	}
-
-	if state.HasPosition {
-		pos := binance.Position{
-			Symbol:      strings.ToUpper(symbol),
-			PositionAmt: state.Quantity,
-			EntryPrice:  state.EntryPrice,
-		}
-		if state.Side == string(strategy.Short) {
-			pos.PositionAmt = -state.Quantity
-		}
-		mp := managedPosition{
-			Symbol:     strings.ToUpper(symbol),
-			Side:       state.Side,
-			Quantity:   state.Quantity,
-			EntryPrice: state.EntryPrice,
-			StopLoss:   state.StopLoss,
-		}
-		if manageOpenPosition(ctx, c, symbol, pos, candles, fundingRate, *cfg, live, &mp) && mp.StopLoss == 0 {
-			state.HasPosition = false
-			state.Side = ""
-			state.Quantity = 0
-			state.EntryPrice = 0
-			state.StopLoss = 0
-			saveLiveState(statePath, state)
-			return nil
-		}
-		state.StopLoss = mp.StopLoss
-		saveLiveState(statePath, state)
 	}
 
 	switch sig.Action {

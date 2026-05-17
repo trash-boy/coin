@@ -41,9 +41,8 @@ func LatestSignal(candles []Candle, ctx Context, cfg Config) (Signal, error) {
 	if err := cfg.Validate(); err != nil {
 		return Signal{}, err
 	}
-	warmup := WarmupBarsForCandles(candles, cfg)
-	if len(candles) < warmup {
-		return Signal{}, fmt.Errorf("need at least %d candles, got %d", warmup, len(candles))
+	if len(candles) < WarmupBars(cfg) {
+		return Signal{}, fmt.Errorf("need at least %d candles, got %d", WarmupBars(cfg), len(candles))
 	}
 	if ctx.Equity <= 0 {
 		return Signal{}, fmt.Errorf("equity must be positive")
@@ -79,10 +78,7 @@ func LatestSignal(candles []Candle, ctx Context, cfg Config) (Signal, error) {
 }
 
 func EntrySide(candles []Candle, ind Indicators, i int, cfg Config, fundingRate float64) (Side, string) {
-	if cfg.Mode == "aggressive_15m" {
-		return entrySideAggressive15m(candles, ind, i, cfg, fundingRate)
-	}
-	if i < WarmupBarsForCandles(candles, cfg) || candles[i].Close <= 0 {
+	if i < WarmupBars(cfg) || candles[i].Close <= 0 {
 		return Flat, "not enough warmed-up indicator history"
 	}
 	volRatio := ind.ATR[i] / candles[i].Close
@@ -149,9 +145,6 @@ func TrendSide(candles []Candle, fast, slow, trend, atr []float64, i int, cfg Co
 }
 
 func StructureStop(candles []Candle, ind Indicators, i int, side Side, cfg Config) (float64, bool, string) {
-	if cfg.Mode == "aggressive_15m" {
-		return structureStopAggressive15m(candles, ind, i, side, cfg)
-	}
 	price := candles[i].Close
 	atr := ind.ATR[i]
 	if atr <= 0 || price <= 0 {
@@ -307,44 +300,6 @@ func EffectiveLeverage(price, atr float64, cfg Config) float64 {
 		return cfg.MaxLeverage
 	}
 	return lev
-}
-
-func ManagedTrailingStop(side Side, entryPrice, currentStop, closePrice, atr float64, cfg Config) (float64, bool) {
-	if entryPrice <= 0 || currentStop <= 0 || closePrice <= 0 || atr <= 0 {
-		return currentStop, false
-	}
-	riskPerUnit := math.Abs(entryPrice - currentStop)
-	if riskPerUnit <= 0 {
-		return currentStop, false
-	}
-	nextStop := currentStop
-	if side == Long {
-		rMultiple := (closePrice - entryPrice) / riskPerUnit
-		if rMultiple >= cfg.BreakEvenR && entryPrice > nextStop {
-			nextStop = entryPrice
-		}
-		if rMultiple >= cfg.TrailActivationR {
-			trail := closePrice - atr*cfg.TrailATR
-			if trail > nextStop {
-				nextStop = trail
-			}
-		}
-		return nextStop, nextStop > currentStop
-	}
-	if side == Short {
-		rMultiple := (entryPrice - closePrice) / riskPerUnit
-		if rMultiple >= cfg.BreakEvenR && entryPrice < nextStop {
-			nextStop = entryPrice
-		}
-		if rMultiple >= cfg.TrailActivationR {
-			trail := closePrice + atr*cfg.TrailATR
-			if trail < nextStop {
-				nextStop = trail
-			}
-		}
-		return nextStop, nextStop < currentStop
-	}
-	return currentStop, false
 }
 
 func hadLongPullback(candles []Candle, ind Indicators, i int, cfg Config) bool {

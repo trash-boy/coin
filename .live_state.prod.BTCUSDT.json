@@ -1,0 +1,15 @@
+{
+  "env": "prod",
+  "symbol": "BTCUSDT",
+  "has_position": false,
+  "side": "",
+  "quantity": 0,
+  "entry_price": 0,
+  "stop_loss": 0,
+  "opened_at": "0001-01-01T00:00:00Z",
+  "last_signal_time": "2026-05-16T04:36:59.999Z",
+  "daily_date": "2026-05-16",
+  "daily_start_equity": 746.66846094,
+  "halted": false,
+  "halt_reason": ""
+}

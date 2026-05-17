@@ -46,22 +46,16 @@ func main() {
 		runLive(os.Args[2:])
 	case "live-scan":
 		runLiveScan(os.Args[2:])
-	case "backtest-15m":
-		runBacktest15m(os.Args[2:])
-	case "signal-15m":
-		runSignal15m(os.Args[2:])
+	case "xsmom-backtest":
+		runXSMomBacktest(os.Args[2:])
+	case "xsmom-signal":
+		runXSMomSignal(os.Args[2:])
+	case "xsmom-live":
+		runXSMomLive(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
 	}
-}
-
-func displayLocation() *time.Location {
-	loc, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil {
-		return time.FixedZone("CST", 8*60*60)
-	}
-	return loc
 }
 
 func runBacktest(args []string) {
@@ -625,134 +619,6 @@ func trimFloat(v float64) string {
 	return fmt.Sprintf("%.8f", v)
 }
 
-
-// --- aggressive 15m strategy entry points ---
-
-func runBacktest15m(args []string) {
-	fs := flag.NewFlagSet("backtest-15m", flag.ExitOnError)
-	symbol := fs.String("symbol", "BTCUSDT", "USD-M futures symbol")
-	days := fs.Int("days", 365, "lookback days (15m bars over this window)")
-	equity := fs.Float64("equity", 10000, "initial USDT equity")
-	env := fs.String("env", "prod", "prod or testnet")
-	useFunding := fs.Bool("funding", true, "include funding-rate history when available")
-	configPath := fs.String("config", "", "flat YAML or JSON strategy config path (overrides defaults)")
-	// Start from the aggressive 15m preset, then let -config / flags override.
-	preset := strategy.Aggressive15mConfig()
-	cfg := &preset
-	bindAggressive15mFlags(fs, cfg)
-	_ = fs.Parse(args)
-	if *configPath != "" {
-		if err := loadConfigFile(*configPath, cfg); err != nil {
-			log.Fatal(err)
-		}
-		_ = fs.Parse(args)
-	}
-	cfg.Mode = "aggressive_15m"
-
-	client := binance.NewFuturesClient(*env)
-	loadLeverageBrackets(context.Background(), client, *symbol, cfg)
-	end := time.Now().UTC()
-	start := end.Add(-time.Duration(*days) * 24 * time.Hour)
-	candles, err := client.KlinesRange(context.Background(), *symbol, "15m", start, end)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if len(candles) == 0 {
-		log.Fatal("no candles returned")
-	}
-	var funding []strategy.FundingRate
-	if *useFunding {
-		funding, err = client.FundingRates(context.Background(), *symbol, start, end)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: funding history unavailable: %v\n", err)
-		}
-	}
-	result, err := backtest.RunWithFunding(candles, *equity, *cfg, funding)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Strategy: aggressive_15m  Symbol: %s 15m\n", strings.ToUpper(*symbol))
-	fmt.Printf("Candles: %d (%s to %s UTC)\n", len(candles), candles[0].OpenTime.Format(time.RFC3339), candles[len(candles)-1].CloseTime.Format(time.RFC3339))
-	fmt.Printf("Initial equity: %.2f USDT\n", result.InitialEquity)
-	fmt.Printf("Final equity:   %.2f USDT\n", result.FinalEquity)
-	fmt.Printf("Return:         %.2f%%\n", result.ReturnPct)
-	fmt.Printf("Max drawdown:   %.2f%%\n", result.MaxDrawdown)
-	fmt.Printf("Trades:         %d\n", len(result.Trades))
-	fmt.Printf("Win rate:       %.2f%%\n", result.WinRate)
-	fmt.Printf("Profit factor:  %.2f\n", result.ProfitFactor)
-	fmt.Printf("Funding paid:   %.2f USDT\n", result.FundingPaid)
-	if len(result.Segments) > 0 {
-		fmt.Println("\nSegments by exit year:")
-		for _, seg := range result.Segments {
-			fmt.Printf("  %s: trades=%d pnl=%.2f win=%.2f%% pf=%.2f\n", seg.Name, seg.Trades, seg.PnL, seg.WinRate, seg.ProfitFactor)
-		}
-	}
-	printSignal("Latest signal", result.LastSignal)
-}
-
-func runSignal15m(args []string) {
-	fs := flag.NewFlagSet("signal-15m", flag.ExitOnError)
-	symbol := fs.String("symbol", "BTCUSDT", "USD-M futures symbol")
-	lookback := fs.Int("lookback", 1500, "recent 15m candles to fetch")
-	equity := fs.Float64("equity", 10000, "current USDT equity for sizing")
-	env := fs.String("env", "prod", "prod or testnet")
-	configPath := fs.String("config", "", "flat YAML or JSON strategy config path (overrides defaults)")
-	preset := strategy.Aggressive15mConfig()
-	cfg := &preset
-	bindAggressive15mFlags(fs, cfg)
-	_ = fs.Parse(args)
-	if *configPath != "" {
-		if err := loadConfigFile(*configPath, cfg); err != nil {
-			log.Fatal(err)
-		}
-		_ = fs.Parse(args)
-	}
-	cfg.Mode = "aggressive_15m"
-
-	client := binance.NewFuturesClient(*env)
-	loadLeverageBrackets(context.Background(), client, *symbol, cfg)
-	candles, err := client.Klines(context.Background(), *symbol, "15m", time.Time{}, time.Time{}, *lookback)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fundingRate := 0.0
-	premium, err := client.PremiumIndex(context.Background(), *symbol)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: premium index unavailable: %v\n", err)
-	} else {
-		fundingRate = premium.LastFundingRate
-	}
-	sig, err := strategy.LatestSignal(candles, strategy.Context{Equity: *equity, FundingRate: fundingRate}, *cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if sig.Action == strategy.ActionEnter {
-		sig = roundSignal(context.Background(), client, *symbol, sig)
-	}
-	printSignal("Signal (aggressive_15m)", sig)
-}
-
-// bindAggressive15mFlags exposes a subset of overridable knobs without
-// touching the legacy configFlags() used by the trend strategy.
-func bindAggressive15mFlags(fs *flag.FlagSet, cfg *strategy.Config) {
-	fs.Float64Var(&cfg.RiskPerTrade, "risk", cfg.RiskPerTrade, "fraction of equity risked per trade")
-	fs.Float64Var(&cfg.MaxLeverage, "leverage", cfg.MaxLeverage, "leverage cap")
-	fs.Float64Var(&cfg.MaxMarginUse, "max-margin-use", cfg.MaxMarginUse, "fraction of leveraged notional to use")
-	fs.Float64Var(&cfg.MaxDrawdown, "max-drawdown", cfg.MaxDrawdown, "account drawdown stop")
-	fs.Float64Var(&cfg.DailyLossLimit, "daily-loss", cfg.DailyLossLimit, "daily loss stop")
-	fs.IntVar(&cfg.BreakoutLookback, "breakout-lookback", cfg.BreakoutLookback, "Donchian breakout length")
-	fs.Float64Var(&cfg.VolumeMultiplier, "volume-mult", cfg.VolumeMultiplier, "min volume vs N-bar avg")
-	fs.Float64Var(&cfg.EntryATRStop, "entry-atr-stop", cfg.EntryATRStop, "initial stop in ATR multiples")
-	fs.Float64Var(&cfg.MinADXLong, "min-adx-long", cfg.MinADXLong, "min ADX for longs")
-	fs.Float64Var(&cfg.MinADXShort, "min-adx-short", cfg.MinADXShort, "min ADX for shorts")
-	fs.Float64Var(&cfg.TrailATR, "trail-atr", cfg.TrailATR, "trailing ATR multiple")
-	fs.Float64Var(&cfg.BreakEvenR, "break-even-r", cfg.BreakEvenR, "R multiple to move stop to break-even")
-	fs.Float64Var(&cfg.TrailActivationR, "trail-activation-r", cfg.TrailActivationR, "R multiple to activate trailing stop")
-	fs.Float64Var(&cfg.FeeRate, "fee", cfg.FeeRate, "taker fee rate per side")
-	fs.Float64Var(&cfg.SlippageBps, "slippage-bps", cfg.SlippageBps, "slippage in basis points")
-}
-
 func usage() {
 	fmt.Println("Usage:")
 	fmt.Println("  go run ./cmd/coin backtest [flags]")
@@ -762,8 +628,9 @@ func usage() {
 	fmt.Println("  go run ./cmd/coin funding-arb [flags]")
 	fmt.Println("  go run ./cmd/coin basis-arb [flags]")
 	fmt.Println("  go run ./cmd/coin live [flags]   # paper / live trading loop (testnet by default, dry-run by default)")
-	fmt.Println("  go run ./cmd/coin backtest-15m [flags]   # aggressive 15m breakout backtest")
-	fmt.Println("  go run ./cmd/coin signal-15m   [flags]   # aggressive 15m breakout signal")
+	fmt.Println("  go run ./cmd/coin xsmom-backtest [flags]   # cross-sectional momentum backtest on top USDT-perps")
+	fmt.Println("  go run ./cmd/coin xsmom-signal [flags]     # latest xsmom target portfolio + order deltas")
+	fmt.Println("  go run ./cmd/coin xsmom-live [flags]       # always-on xsmom rebalancer (default dry-run)")
 	fmt.Println("")
 	fmt.Println("Examples:")
 	fmt.Println("  go run ./cmd/coin backtest -symbol BTCUSDT -interval 1h -days 2500 -equity 10000 -leverage 2")
@@ -772,6 +639,8 @@ func usage() {
 	fmt.Println("  go run ./cmd/coin funding-arb -symbols BTCUSDT,ETHUSDT,SOLUSDT -min-funding-bps 1")
 	fmt.Println("  go run ./cmd/coin basis-arb -symbols BTCUSDT,ETHUSDT,SOLUSDT -cost-bps 8 -min-edge-bps 3")
 	fmt.Println("  go run ./cmd/coin live -symbol BTCUSDT -interval 1h -env testnet -dry-run=true")
-	fmt.Println("  go run ./cmd/coin backtest-15m -symbol BTCUSDT -days 365 -equity 10000")
-	fmt.Println("  go run ./cmd/coin signal-15m   -symbol ETHUSDT -equity 10000")
+	fmt.Println("  go run ./cmd/coin xsmom-backtest -top 100 -days 360 -equity 10000 -lookback 21 -hold 7 -topn 10 -botn 0 -leverage 1")
+	fmt.Println("  go run ./cmd/coin xsmom-signal -top 100 -days 360 -equity 10000 -current ./positions.json")
+	fmt.Println("  go run ./cmd/coin xsmom-live -top 100 -days 360 -use-account-equity -dry-run=true   # safe preview")
+	fmt.Println("  go run ./cmd/coin xsmom-live -top 100 -days 360 -use-account-equity -dry-run=false  # LIVE TRADING")
 }

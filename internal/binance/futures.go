@@ -58,12 +58,11 @@ func NewFuturesClient(env string) *FuturesClient {
 	}
 }
 
-// defaultTransport 返回 http.Transport;保留 Go 默认读取 HTTP_PROXY/HTTPS_PROXY/
-// NO_PROXY 的行为。若能从 SSL_CERT_FILE 或项目根/工作目录的 cacert.pem 读到
-// PEM,则把 RootCAs 显式注入,绕开 macOS 26 上 crypto/x509 调
+// defaultTransport 返回 http.Transport;若能从 SSL_CERT_FILE 或项目根/工作目录的
+// cacert.pem 读到 PEM,则把 RootCAs 显式注入,绕开 macOS 26 上 crypto/x509 调
 // SecTrustEvaluateWithError 返回 OSStatus -26276 的兼容性问题。
 func defaultTransport() *http.Transport {
-	t := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	t := &http.Transport{}
 	if pool := loadRootCAsFromFile(); pool != nil {
 		t.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}

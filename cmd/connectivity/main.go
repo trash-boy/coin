@@ -49,10 +49,7 @@ func main() {
 	if pool := loadRootCAs(); pool != nil {
 		c.HTTP = &http.Client{
 			Timeout:   15 * time.Second,
-			Transport: &http.Transport{
-				Proxy:           http.ProxyFromEnvironment,
-				TLSClientConfig: &tls.Config{RootCAs: pool},
-			},
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
 		}
 	}
 	fmt.Printf("== Binance USDⓈ-M connectivity probe ==\nBaseURL : %s\nSymbol  : %s\n\n", c.BaseURL, symbol)

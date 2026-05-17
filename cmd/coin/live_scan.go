@@ -22,14 +22,14 @@ import (
 // runLiveScan implements the `live-scan` subcommand.
 //
 // Behaviour:
-//  1. enumerate all USD-M PERPETUAL contracts quoted in USDT via exchangeInfo
-//     joined with /fapi/v1/ticker/24hr;
-//  2. drop symbols with 24h quote volume below -min-quote-volume USDT;
-//  3. on every candle close, evaluate strategy.LatestSignal for each symbol
-//     concurrently (capped by -workers);
-//  4. take all ENTER signals, sort by ATR/close descending, cap by
-//     max-positions minus already-held positions, and place real orders;
-//  5. EXIT signals on currently-held symbols always run.
+//   1. enumerate all USD-M PERPETUAL contracts quoted in USDT via exchangeInfo
+//      joined with /fapi/v1/ticker/24hr;
+//   2. drop symbols with 24h quote volume below -min-quote-volume USDT;
+//   3. on every candle close, evaluate strategy.LatestSignal for each symbol
+//      concurrently (capped by -workers);
+//   4. take all ENTER signals, sort by ATR/close descending, cap by
+//      max-positions minus already-held positions, and place real orders;
+//   5. EXIT signals on currently-held symbols always run.
 //
 // Per the user's explicit instruction, dry-run is REQUIRED to be disabled
 // AND -i-understand-risk must be true. There is no first-cycle dry-run grace.
@@ -112,7 +112,7 @@ func runLiveScan(args []string) {
 		next := nextCloseTime(time.Now().UTC(), dur).Add(5 * time.Second)
 		sleep := time.Until(next)
 		if sleep > 0 {
-			fmt.Printf("[wait] next eval at %s CST (in %v)\n", next.In(displayLocation()).Format("2006-01-02 15:04:05"), sleep.Round(time.Second))
+			fmt.Printf("[wait] next eval at %s UTC (in %v)\n", next.UTC().Format("15:04:05"), sleep.Round(time.Second))
 			if !sleepWithCancel(ctx, sleep) {
 				return
 			}
@@ -129,26 +129,21 @@ func runLiveScan(args []string) {
 }
 
 type scannerState struct {
-	Env             string                     `json:"env"`
-	DailyDate       string                     `json:"daily_date"`
-	DailyStartEquit float64                    `json:"daily_start_equity"`
-	PeakEquity      float64                    `json:"peak_equity"`
-	Frozen          bool                       `json:"frozen"`
-	FreezeReason    string                     `json:"freeze_reason"`
-	Positions       map[string]managedPosition `json:"positions"`
+	Env             string  `json:"env"`
+	DailyDate       string  `json:"daily_date"`
+	DailyStartEquit float64 `json:"daily_start_equity"`
+	Frozen          bool    `json:"frozen"`
+	FreezeReason    string  `json:"freeze_reason"`
 }
 
 func loadScannerState(path, env string) scannerState {
-	st := scannerState{Env: env, Positions: map[string]managedPosition{}}
+	st := scannerState{Env: env}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return st
 	}
 	_ = json.Unmarshal(b, &st)
 	st.Env = env
-	if st.Positions == nil {
-		st.Positions = map[string]managedPosition{}
-	}
 	return st
 }
 
@@ -170,9 +165,6 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 	lookback int, equityOverride, maxDailyLossPct float64, live bool,
 	cfg *strategy.Config, minQuoteVol float64, maxPositions, workers int,
 	stateDir, envName, scannerStatePath string, sst *scannerState, verbose bool) error {
-	if sst.Positions == nil {
-		sst.Positions = map[string]managedPosition{}
-	}
 
 	dur, derr := candleDuration(interval)
 	if derr != nil {
@@ -197,9 +189,6 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 		sst.Frozen = false
 		sst.FreezeReason = ""
 	}
-	if sst.PeakEquity <= 0 || equity > sst.PeakEquity {
-		sst.PeakEquity = equity
-	}
 	if sst.DailyStartEquit > 0 {
 		drawdown := (sst.DailyStartEquit - equity) / sst.DailyStartEquit * 100
 		if drawdown >= maxDailyLossPct {
@@ -207,17 +196,10 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 			sst.FreezeReason = fmt.Sprintf("daily DD %.2f%% >= %.2f%%", drawdown, maxDailyLossPct)
 		}
 	}
-	if sst.PeakEquity > 0 {
-		drawdown := (sst.PeakEquity - equity) / sst.PeakEquity
-		if drawdown >= cfg.MaxDrawdown {
-			sst.Frozen = true
-			sst.FreezeReason = fmt.Sprintf("max DD %.2f%% >= %.2f%%", drawdown*100, cfg.MaxDrawdown*100)
-		}
-	}
 	saveScannerState(scannerStatePath, sst)
 
 	fmt.Printf("\n[cycle %s] equity=%.4f USDT  available=%.4f  uPnL=%.4f  dailyStart=%.4f  frozen=%v\n",
-		time.Now().In(displayLocation()).Format("2006-01-02 15:04:05 CST"),
+		time.Now().UTC().Format("2006-01-02 15:04:05Z"),
 		equity, balance.AvailableBalance, balance.CrossUnPnL, sst.DailyStartEquit, sst.Frozen)
 
 	listed, err := c.ListUSDTPerpetuals(ctx, minQuoteVol)
@@ -244,17 +226,6 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 		freeSlots = 0
 	}
 	fmt.Printf("[pos ] open=%d  freeSlots=%d/%d\n", len(open), freeSlots, maxPositions)
-
-	if sst.Frozen && len(open) > 0 {
-		fmt.Println("[risk] kill-switch frozen; closing open positions:", sst.FreezeReason)
-		for sym, pos := range open {
-			if closeExchangePosition(ctx, c, sym, pos, live, sst.FreezeReason) {
-				delete(sst.Positions, sym)
-			}
-		}
-		saveScannerState(scannerStatePath, sst)
-		return nil
-	}
 
 	universe := map[string]struct{}{}
 	for _, s := range listed {
@@ -328,32 +299,6 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 					fmt.Fprintf(os.Stderr, "[%s] strategy err: %v\n", sym, serr)
 					continue
 				}
-				if heldPos, held := open[sym]; held {
-					mu.Lock()
-					mp := sst.Positions[sym]
-					mu.Unlock()
-					if mp.StopLoss <= 0 {
-						mp = managedPosition{
-							Symbol:     sym,
-							Side:       string(sideFromPosition(heldPos)),
-							Quantity:   absFloat(heldPos.PositionAmt),
-							EntryPrice: heldPos.EntryPrice,
-							StopLoss:   mp.StopLoss,
-						}
-					}
-					if manageOpenPosition(ctx, c, sym, heldPos, candles, fundingRate, symbolCfg, live, &mp) {
-						mu.Lock()
-						if mp.StopLoss <= 0 {
-							delete(sst.Positions, sym)
-						} else {
-							sst.Positions[sym] = mp
-						}
-						mu.Unlock()
-					}
-					if mp.StopLoss <= 0 {
-						continue
-					}
-				}
 				atrRatio := computeATRRatio(candles, symbolCfg.ATRPeriod)
 				if verbose {
 					last := candles[len(candles)-1]
@@ -377,7 +322,6 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 		}()
 	}
 	wg.Wait()
-	saveScannerState(scannerStatePath, sst)
 
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].ATRRatio > candidates[j].ATRRatio
@@ -387,9 +331,7 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 
 	for _, ex := range exits {
 		handleScanExit(ctx, c, ex.Symbol, ex.Signal, live, stateDir, envName, open[ex.Symbol])
-		delete(sst.Positions, ex.Symbol)
 	}
-	saveScannerState(scannerStatePath, sst)
 
 	if sst.Frozen {
 		fmt.Println("[skip] kill-switch frozen; not opening new positions:", sst.FreezeReason)
@@ -422,14 +364,6 @@ func scanCycle(ctx context.Context, c *binance.FuturesClient, interval string,
 			continue
 		}
 		fmt.Printf("[live] %s entry=%d stop=%d\n", cand.Symbol, res.Entry.OrderID, res.Stop.OrderID)
-		sst.Positions[cand.Symbol] = managedPosition{
-			Symbol:     cand.Symbol,
-			Side:       string(cand.Signal.Side),
-			Quantity:   cand.Signal.Quantity,
-			EntryPrice: cand.Signal.Price,
-			StopLoss:   cand.Signal.StopLoss,
-		}
-		saveScannerState(scannerStatePath, sst)
 		taken++
 	}
 	if taken == 0 && len(candidates) == 0 {

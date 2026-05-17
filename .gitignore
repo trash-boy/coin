@@ -1,8 +1,22 @@
+# Secrets
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Local state
+.coin/
+state.json
+trade.log
 *.log
-/coin
-.gocache/
+
+# IDE
 .idea/
-.live_state.*.json
-.live_scan_state.*.json
+.vscode/
+*.swp
 .DS_Store
+
+# Build
+/coin
+/dist/
