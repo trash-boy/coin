@@ -1,4 +1,8 @@
 .env
 *.log
-coin
+/coin
+.gocache/
+.idea/
+.live_state.*.json
+.live_scan_state.*.json
 .DS_Store
