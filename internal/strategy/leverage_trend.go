@@ -79,6 +79,9 @@ func LatestSignal(candles []Candle, ctx Context, cfg Config) (Signal, error) {
 }
 
 func EntrySide(candles []Candle, ind Indicators, i int, cfg Config, fundingRate float64) (Side, string) {
+	if cfg.Mode == "aggressive_15m" {
+		return entrySideAggressive15m(candles, ind, i, cfg, fundingRate)
+	}
 	if i < WarmupBarsForCandles(candles, cfg) || candles[i].Close <= 0 {
 		return Flat, "not enough warmed-up indicator history"
 	}
@@ -146,6 +149,9 @@ func TrendSide(candles []Candle, fast, slow, trend, atr []float64, i int, cfg Co
 }
 
 func StructureStop(candles []Candle, ind Indicators, i int, side Side, cfg Config) (float64, bool, string) {
+	if cfg.Mode == "aggressive_15m" {
+		return structureStopAggressive15m(candles, ind, i, side, cfg)
+	}
 	price := candles[i].Close
 	atr := ind.ATR[i]
 	if atr <= 0 || price <= 0 {

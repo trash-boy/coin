@@ -98,6 +98,12 @@ type Config struct {
 	MaxATRRatio float64
 	FeeRate     float64
 	SlippageBps float64
+
+	// --- Aggressive 15m mode ---
+	Mode             string  // "" = leverage_trend default; "aggressive_15m" = 15m breakout
+	BreakoutLookback int     // Donchian length, e.g. 20
+	VolumeMultiplier float64 // volume >= avg * this, e.g. 1.5
+	EntryATRStop     float64 // initial stop = entry +/- this * ATR, e.g. 1.5
 }
 
 func DefaultConfig() Config {
@@ -156,6 +162,10 @@ func DefaultConfig() Config {
 		MaxATRRatio:           0.08,
 		FeeRate:               0.0004,
 		SlippageBps:           2.0,
+		Mode:                  "",
+		BreakoutLookback:      20,
+		VolumeMultiplier:      1.5,
+		EntryATRStop:          1.5,
 	}
 }
 
