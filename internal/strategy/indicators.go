@@ -138,10 +138,32 @@ func Closes(candles []Candle) []float64 {
 }
 
 func WarmupBars(cfg Config) int {
+	return WarmupBarsForDuration(cfg, time.Hour)
+}
+
+func WarmupBarsForDuration(cfg Config, candleDuration time.Duration) int {
+	if candleDuration <= 0 {
+		candleDuration = time.Hour
+	}
+	higherBars := int(math.Ceil(float64(time.Duration(cfg.HigherTFHours)*time.Hour) / float64(candleDuration)))
+	majorBars := int(math.Ceil(float64(time.Duration(cfg.MajorTFHours)*time.Hour) / float64(candleDuration)))
+	if higherBars < 1 {
+		higherBars = 1
+	}
+	if majorBars < 1 {
+		majorBars = 1
+	}
 	base := maxInt(cfg.TrendEMA*3, maxInt(cfg.SlowEMA*3, maxInt(cfg.ATRPeriod*3, maxInt(cfg.ADXPeriod*3, cfg.EfficiencyPeriod*3))))
-	base = maxInt(base, cfg.HigherSlowEMA*cfg.HigherTFHours*3)
-	base = maxInt(base, cfg.HigherSlowEMA*cfg.MajorTFHours*3)
+	base = maxInt(base, cfg.HigherSlowEMA*higherBars*3)
+	base = maxInt(base, cfg.HigherSlowEMA*majorBars*3)
 	return base + maxInt(cfg.PullbackBars, cfg.SwingLookback) + 5
+}
+
+func WarmupBarsForCandles(candles []Candle, cfg Config) int {
+	if len(candles) < 2 {
+		return WarmupBars(cfg)
+	}
+	return WarmupBarsForDuration(cfg, candles[1].OpenTime.Sub(candles[0].OpenTime))
 }
 
 func AggregateCandles(candles []Candle, bucket time.Duration) []Candle {

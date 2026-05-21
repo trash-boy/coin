@@ -41,8 +41,9 @@ func LatestSignal(candles []Candle, ctx Context, cfg Config) (Signal, error) {
 	if err := cfg.Validate(); err != nil {
 		return Signal{}, err
 	}
-	if len(candles) < WarmupBars(cfg) {
-		return Signal{}, fmt.Errorf("need at least %d candles, got %d", WarmupBars(cfg), len(candles))
+	warmup := WarmupBarsForCandles(candles, cfg)
+	if len(candles) < warmup {
+		return Signal{}, fmt.Errorf("need at least %d candles, got %d", warmup, len(candles))
 	}
 	if ctx.Equity <= 0 {
 		return Signal{}, fmt.Errorf("equity must be positive")
@@ -78,7 +79,7 @@ func LatestSignal(candles []Candle, ctx Context, cfg Config) (Signal, error) {
 }
 
 func EntrySide(candles []Candle, ind Indicators, i int, cfg Config, fundingRate float64) (Side, string) {
-	if i < WarmupBars(cfg) || candles[i].Close <= 0 {
+	if i < WarmupBarsForCandles(candles, cfg) || candles[i].Close <= 0 {
 		return Flat, "not enough warmed-up indicator history"
 	}
 	volRatio := ind.ATR[i] / candles[i].Close
@@ -300,6 +301,44 @@ func EffectiveLeverage(price, atr float64, cfg Config) float64 {
 		return cfg.MaxLeverage
 	}
 	return lev
+}
+
+func ManagedTrailingStop(side Side, entryPrice, currentStop, closePrice, atr float64, cfg Config) (float64, bool) {
+	if entryPrice <= 0 || currentStop <= 0 || closePrice <= 0 || atr <= 0 {
+		return currentStop, false
+	}
+	risk := math.Abs(entryPrice - currentStop)
+	if risk <= 0 {
+		return currentStop, false
+	}
+	next := currentStop
+	if side == Long {
+		r := (closePrice - entryPrice) / risk
+		if r >= cfg.BreakEvenR && entryPrice > next {
+			next = entryPrice
+		}
+		if r >= cfg.TrailActivationR {
+			trail := closePrice - atr*cfg.TrailATR
+			if trail > next {
+				next = trail
+			}
+		}
+		return next, next > currentStop
+	}
+	if side == Short {
+		r := (entryPrice - closePrice) / risk
+		if r >= cfg.BreakEvenR && entryPrice < next {
+			next = entryPrice
+		}
+		if r >= cfg.TrailActivationR {
+			trail := closePrice + atr*cfg.TrailATR
+			if trail < next {
+				next = trail
+			}
+		}
+		return next, next < currentStop
+	}
+	return currentStop, false
 }
 
 func hadLongPullback(candles []Candle, ind Indicators, i int, cfg Config) bool {

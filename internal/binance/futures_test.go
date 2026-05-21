@@ -19,6 +19,10 @@ func TestKlinesAndSymbolRules(t *testing.T) {
 		case "/fapi/v1/exchangeInfo":
 			fmt.Fprint(w, `{"symbols":[{"symbol":"BTCUSDT","filters":[{"filterType":"LOT_SIZE","minQty":"0.001","stepSize":"0.001"},{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"MIN_NOTIONAL","notional":"100"}]}]}`)
 		case "/fapi/v1/premiumIndex":
+			if r.URL.Query().Get("symbol") == "" {
+				fmt.Fprint(w, `[{"symbol":"BTCUSDT","markPrice":"105.0","indexPrice":"104.9","lastFundingRate":"0.00010000","nextFundingTime":1735718400000,"time":1735689600000}]`)
+				return
+			}
 			fmt.Fprint(w, `{"symbol":"BTCUSDT","markPrice":"105.0","indexPrice":"104.9","lastFundingRate":"0.00010000","nextFundingTime":1735718400000,"time":1735689600000}`)
 		case "/fapi/v1/fundingRate":
 			fmt.Fprint(w, `[{"symbol":"BTCUSDT","fundingRate":"0.00010000","fundingTime":1735689600000,"markPrice":"105.0"}]`)
@@ -44,6 +48,21 @@ func TestKlinesAndSymbolRules(t *testing.T) {
 			}
 			fmt.Fprintf(w, `{"clientOrderId":%q,"orderId":123,"symbol":"BTCUSDT","status":"NEW","type":%q,"side":%q,"avgPrice":"0","executedQty":"0"}`,
 				r.URL.Query().Get("newClientOrderId"), r.URL.Query().Get("type"), r.URL.Query().Get("side"))
+		case "/fapi/v1/algoOrder":
+			if r.URL.Query().Get("algoType") != "CONDITIONAL" {
+				http.Error(w, "expected conditional algo order", http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Get("clientAlgoId") == "" {
+				http.Error(w, "expected client algo id", http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Get("triggerPrice") == "" {
+				http.Error(w, "expected trigger price", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprintf(w, `{"clientAlgoId":%q,"algoId":789,"symbol":"BTCUSDT","algoStatus":"NEW","orderType":%q,"side":%q,"quantity":%q}`,
+				r.URL.Query().Get("clientAlgoId"), r.URL.Query().Get("type"), r.URL.Query().Get("side"), r.URL.Query().Get("quantity"))
 		case "/fapi/v1/listenKey":
 			fmt.Fprint(w, `{"listenKey":"abc"}`)
 		default:
@@ -84,6 +103,13 @@ func TestKlinesAndSymbolRules(t *testing.T) {
 	}
 	if premium.LastFundingRate != 0.0001 {
 		t.Fatalf("unexpected funding rate: %f", premium.LastFundingRate)
+	}
+	premiums, err := client.PremiumIndexes(context.Background())
+	if err != nil {
+		t.Fatalf("PremiumIndexes returned error: %v", err)
+	}
+	if premiums["BTCUSDT"].LastFundingRate != 0.0001 {
+		t.Fatalf("unexpected premium map: %+v", premiums)
 	}
 
 	funding, err := client.FundingRates(context.Background(), "BTCUSDT", time.UnixMilli(1735689600000), time.UnixMilli(1735718400000))

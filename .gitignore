@@ -8,6 +8,9 @@
 # Local state
 .coin/
 state.json
+*.state.json
+.live_scan_state.*.json
+.live_state.*.json
 trade.log
 *.log
 
@@ -20,3 +23,4 @@ trade.log
 # Build
 /coin
 /dist/
+.gocache/

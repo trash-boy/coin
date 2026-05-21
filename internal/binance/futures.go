@@ -58,11 +58,12 @@ func NewFuturesClient(env string) *FuturesClient {
 	}
 }
 
-// defaultTransport 返回 http.Transport;若能从 SSL_CERT_FILE 或项目根/工作目录的
-// cacert.pem 读到 PEM,则把 RootCAs 显式注入,绕开 macOS 26 上 crypto/x509 调
+// defaultTransport 返回 http.Transport;保留 Go 默认读取 HTTP_PROXY/HTTPS_PROXY/
+// NO_PROXY 的行为。若能从 SSL_CERT_FILE 或项目根/工作目录的 cacert.pem 读到
+// PEM,则把 RootCAs 显式注入,绕开 macOS 26 上 crypto/x509 调
 // SecTrustEvaluateWithError 返回 OSStatus -26276 的兼容性问题。
 func defaultTransport() *http.Transport {
-	t := &http.Transport{}
+	t := &http.Transport{Proxy: http.ProxyFromEnvironment}
 	if pool := loadRootCAsFromFile(); pool != nil {
 		t.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
@@ -97,6 +98,8 @@ type SymbolRules struct {
 	Symbol      string
 	StepSize    float64
 	TickSize    float64
+	StepScale   int
+	TickScale   int
 	MinQty      float64
 	MinNotional float64
 }
@@ -139,14 +142,24 @@ func (r SymbolRules) RoundQuantity(qty float64) float64 {
 	if r.StepSize <= 0 {
 		return qty
 	}
-	return math.Floor(qty/r.StepSize) * r.StepSize
+	return roundToScale(math.Floor((qty/r.StepSize)+1e-9)*r.StepSize, r.StepScale)
 }
 
 func (r SymbolRules) RoundPrice(price float64) float64 {
 	if r.TickSize <= 0 {
 		return price
 	}
-	return math.Round(price/r.TickSize) * r.TickSize
+	return roundToScale(math.Round(price/r.TickSize)*r.TickSize, r.TickScale)
+}
+
+func (r SymbolRules) FormatQuantity(qty float64) string {
+	qty = r.RoundQuantity(qty)
+	return strconv.FormatFloat(qty, 'f', r.StepScale, 64)
+}
+
+func (r SymbolRules) FormatPrice(price float64) string {
+	price = r.RoundPrice(price)
+	return strconv.FormatFloat(price, 'f', r.TickScale, 64)
 }
 
 func (r SymbolRules) ValidNotional(qty, price float64) bool {
@@ -281,9 +294,11 @@ func (c *FuturesClient) SymbolRules(ctx context.Context, symbol string) (SymbolR
 			switch f.FilterType {
 			case "LOT_SIZE":
 				rules.StepSize, _ = strconv.ParseFloat(f.StepSize, 64)
+				rules.StepScale = decimalScale(f.StepSize)
 				rules.MinQty, _ = strconv.ParseFloat(f.MinQty, 64)
 			case "PRICE_FILTER":
 				rules.TickSize, _ = strconv.ParseFloat(f.TickSize, 64)
+				rules.TickScale = decimalScale(f.TickSize)
 			case "MIN_NOTIONAL":
 				if f.Notional != "" {
 					rules.MinNotional, _ = strconv.ParseFloat(f.Notional, 64)
@@ -300,37 +315,27 @@ func (c *FuturesClient) SymbolRules(ctx context.Context, symbol string) (SymbolR
 func (c *FuturesClient) PremiumIndex(ctx context.Context, symbol string) (PremiumIndex, error) {
 	params := url.Values{}
 	params.Set("symbol", strings.ToUpper(symbol))
-	var raw struct {
-		Symbol          string `json:"symbol"`
-		MarkPrice       string `json:"markPrice"`
-		IndexPrice      string `json:"indexPrice"`
-		LastFundingRate string `json:"lastFundingRate"`
-		NextFundingTime int64  `json:"nextFundingTime"`
-		Time            int64  `json:"time"`
-	}
+	var raw premiumIndexRaw
 	if err := c.publicGET(ctx, "/fapi/v1/premiumIndex", params, &raw); err != nil {
 		return PremiumIndex{}, err
 	}
-	mark, err := strconv.ParseFloat(raw.MarkPrice, 64)
-	if err != nil {
-		return PremiumIndex{}, err
+	return raw.premiumIndex()
+}
+
+func (c *FuturesClient) PremiumIndexes(ctx context.Context) (map[string]PremiumIndex, error) {
+	var raw []premiumIndexRaw
+	if err := c.publicGET(ctx, "/fapi/v1/premiumIndex", url.Values{}, &raw); err != nil {
+		return nil, err
 	}
-	index, err := strconv.ParseFloat(raw.IndexPrice, 64)
-	if err != nil {
-		return PremiumIndex{}, err
+	out := make(map[string]PremiumIndex, len(raw))
+	for _, row := range raw {
+		pi, err := row.premiumIndex()
+		if err != nil {
+			continue
+		}
+		out[strings.ToUpper(pi.Symbol)] = pi
 	}
-	rate, err := strconv.ParseFloat(raw.LastFundingRate, 64)
-	if err != nil {
-		return PremiumIndex{}, err
-	}
-	return PremiumIndex{
-		Symbol:          raw.Symbol,
-		MarkPrice:       mark,
-		IndexPrice:      index,
-		LastFundingRate: rate,
-		NextFundingTime: time.UnixMilli(raw.NextFundingTime).UTC(),
-		Time:            time.UnixMilli(raw.Time).UTC(),
-	}, nil
+	return out, nil
 }
 
 func (c *FuturesClient) FuturesBookTicker(ctx context.Context, symbol string) (BookTicker, error) {
@@ -417,9 +422,7 @@ func (c *FuturesClient) FundingRates(ctx context.Context, symbol string, start, 
 func (c *FuturesClient) LeverageBrackets(ctx context.Context, symbol string) ([]strategy.MaintenanceBracket, error) {
 	params := url.Values{}
 	params.Set("symbol", strings.ToUpper(symbol))
-	// Binance /fapi/v1/leverageBracket always returns a JSON array,
-	// even when ?symbol=... narrows it to a single element. Decode as a slice.
-	var raw []struct {
+	type bracketEntry struct {
 		Symbol   string `json:"symbol"`
 		Brackets []struct {
 			NotionalFloor    float64 `json:"notionalFloor"`
@@ -429,20 +432,20 @@ func (c *FuturesClient) LeverageBrackets(ctx context.Context, symbol string) ([]
 			InitialLeverage  int     `json:"initialLeverage"`
 		} `json:"brackets"`
 	}
-	if err := c.signedRequest(ctx, http.MethodGet, "/fapi/v1/leverageBracket", params, &raw); err != nil {
+	var body json.RawMessage
+	if err := c.signedRequest(ctx, http.MethodGet, "/fapi/v1/leverageBracket", params, &body); err != nil {
 		return nil, err
 	}
-	upper := strings.ToUpper(symbol)
-	var entry *struct {
-		Symbol   string `json:"symbol"`
-		Brackets []struct {
-			NotionalFloor    float64 `json:"notionalFloor"`
-			NotionalCap      float64 `json:"notionalCap"`
-			MaintMarginRatio float64 `json:"maintMarginRatio"`
-			Cum              float64 `json:"cum"`
-			InitialLeverage  int     `json:"initialLeverage"`
-		} `json:"brackets"`
+	var raw []bracketEntry
+	if err := json.Unmarshal(body, &raw); err != nil {
+		var single bracketEntry
+		if singleErr := json.Unmarshal(body, &single); singleErr != nil {
+			return nil, fmt.Errorf("decode leverage brackets: %w", err)
+		}
+		raw = []bracketEntry{single}
 	}
+	upper := strings.ToUpper(symbol)
+	var entry *bracketEntry
 	for i := range raw {
 		if strings.EqualFold(raw[i].Symbol, upper) {
 			entry = &raw[i]
@@ -518,12 +521,20 @@ func (c *FuturesClient) PlaceMarketOrder(ctx context.Context, symbol string, sid
 }
 
 func (c *FuturesClient) PlaceMarketOrderWithID(ctx context.Context, symbol string, side string, qty float64, reduceOnly bool, clientOrderID string) (OrderResponse, error) {
+	return c.PlaceMarketOrderWithPositionSide(ctx, symbol, side, qty, reduceOnly, "", clientOrderID)
+}
+
+func (c *FuturesClient) PlaceMarketOrderWithPositionSide(ctx context.Context, symbol string, side string, qty float64, reduceOnly bool, positionSide string, clientOrderID string) (OrderResponse, error) {
 	params := url.Values{}
 	params.Set("symbol", strings.ToUpper(symbol))
 	params.Set("side", strings.ToUpper(side))
 	params.Set("type", "MARKET")
 	params.Set("quantity", formatFloat(qty))
 	params.Set("newClientOrderId", clientOrderID)
+	if strings.TrimSpace(positionSide) != "" {
+		params.Set("positionSide", strings.ToUpper(positionSide))
+		reduceOnly = false
+	}
 	if reduceOnly {
 		params.Set("reduceOnly", "true")
 	}
@@ -541,30 +552,50 @@ func (c *FuturesClient) PlaceStopMarketOrder(ctx context.Context, symbol string,
 	return c.placeConditionalMarketOrder(ctx, symbol, side, "STOP_MARKET", qty, stopPrice, reduceOnly, clientOrderID)
 }
 
+func (c *FuturesClient) PlaceStopMarketOrderWithPositionSide(ctx context.Context, symbol string, side string, qty float64, stopPrice float64, positionSide string, clientOrderID string) (OrderResponse, error) {
+	return c.placeConditionalMarketOrderWithPositionSide(ctx, symbol, side, "STOP_MARKET", qty, stopPrice, false, positionSide, clientOrderID)
+}
+
 func (c *FuturesClient) PlaceTakeProfitMarketOrder(ctx context.Context, symbol string, side string, qty float64, stopPrice float64, reduceOnly bool, clientOrderID string) (OrderResponse, error) {
 	return c.placeConditionalMarketOrder(ctx, symbol, side, "TAKE_PROFIT_MARKET", qty, stopPrice, reduceOnly, clientOrderID)
 }
 
+func (c *FuturesClient) PlaceTakeProfitMarketOrderWithPositionSide(ctx context.Context, symbol string, side string, qty float64, stopPrice float64, positionSide string, clientOrderID string) (OrderResponse, error) {
+	return c.placeConditionalMarketOrderWithPositionSide(ctx, symbol, side, "TAKE_PROFIT_MARKET", qty, stopPrice, false, positionSide, clientOrderID)
+}
+
 func (c *FuturesClient) placeConditionalMarketOrder(ctx context.Context, symbol string, side string, orderType string, qty float64, stopPrice float64, reduceOnly bool, clientOrderID string) (OrderResponse, error) {
+	return c.placeConditionalMarketOrderWithPositionSide(ctx, symbol, side, orderType, qty, stopPrice, reduceOnly, "", clientOrderID)
+}
+
+func (c *FuturesClient) placeConditionalMarketOrderWithPositionSide(ctx context.Context, symbol string, side string, orderType string, qty float64, stopPrice float64, reduceOnly bool, positionSide string, clientOrderID string) (OrderResponse, error) {
 	if clientOrderID == "" {
 		clientOrderID = newClientOrderID("coin_cond")
+	}
+	qtyStr := formatFloat(qty)
+	stopStr := formatFloat(stopPrice)
+	if rules, err := c.SymbolRules(ctx, symbol); err == nil {
+		qtyStr = rules.FormatQuantity(qty)
+		stopStr = rules.FormatPrice(stopPrice)
 	}
 	params := url.Values{}
 	params.Set("symbol", strings.ToUpper(symbol))
 	params.Set("side", strings.ToUpper(side))
-	params.Set("type", orderType)
-	params.Set("quantity", formatFloat(qty))
-	params.Set("stopPrice", formatFloat(stopPrice))
+	params.Set("type", strings.ToUpper(orderType))
+	params.Set("quantity", qtyStr)
+	params.Set("triggerPrice", stopStr)
 	params.Set("workingType", "MARK_PRICE")
-	params.Set("newClientOrderId", clientOrderID)
+	params.Set("algoType", "CONDITIONAL")
+	params.Set("clientAlgoId", clientOrderID)
+	if strings.TrimSpace(positionSide) != "" {
+		params.Set("positionSide", strings.ToUpper(positionSide))
+		reduceOnly = false
+	}
 	if reduceOnly {
 		params.Set("reduceOnly", "true")
 	}
-	var raw orderResponseRaw
-	if err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/order", params, &raw); err != nil {
-		if isDuplicateClientOrderErr(err) && clientOrderID != "" {
-			return c.QueryOrderByClientID(ctx, symbol, clientOrderID)
-		}
+	var raw algoOrderResponseRaw
+	if err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/algoOrder", params, &raw); err != nil {
 		return OrderResponse{}, err
 	}
 	return raw.orderResponse(), nil
@@ -593,13 +624,22 @@ func (c *FuturesClient) OpenProtectedMarketPosition(ctx context.Context, symbol 
 	if entrySide == "" {
 		return ProtectedOrderResult{}, fmt.Errorf("unsupported signal side %s", sig.Side)
 	}
-	entry, err := c.PlaceMarketOrderWithID(ctx, symbol, entrySide, sig.Quantity, false, newClientOrderID("coin_entry"))
+	if rules, err := c.SymbolRules(ctx, symbol); err == nil {
+		sig.Quantity = rules.RoundQuantity(sig.Quantity)
+		sig.StopLoss = rules.RoundPrice(sig.StopLoss)
+		sig.Notional = sig.Quantity * sig.Price
+	}
+	if sig.Quantity <= 0 || sig.StopLoss <= 0 {
+		return ProtectedOrderResult{}, fmt.Errorf("signal rounds to invalid quantity or stop")
+	}
+	positionSide := string(sig.Side)
+	entry, err := c.PlaceMarketOrderWithPositionSide(ctx, symbol, entrySide, sig.Quantity, false, positionSide, newClientOrderID("coin_entry"))
 	if err != nil {
 		return ProtectedOrderResult{}, fmt.Errorf("entry order: %w", err)
 	}
-	stop, err := c.PlaceStopMarketOrder(ctx, symbol, stopSide, sig.Quantity, sig.StopLoss, true, newClientOrderID("coin_stop"))
+	stop, err := c.PlaceStopMarketOrderWithPositionSide(ctx, symbol, stopSide, sig.Quantity, sig.StopLoss, positionSide, newClientOrderID("coin_stop"))
 	if err != nil {
-		_, reduceErr := c.PlaceMarketOrderWithID(ctx, symbol, stopSide, sig.Quantity, true, newClientOrderID("coin_rollback"))
+		_, reduceErr := c.PlaceMarketOrderWithPositionSide(ctx, symbol, stopSide, sig.Quantity, true, positionSide, newClientOrderID("coin_rollback"))
 		if reduceErr != nil {
 			return ProtectedOrderResult{Entry: entry}, fmt.Errorf("stop order failed: %w; rollback failed: %v", err, reduceErr)
 		}
@@ -857,6 +897,34 @@ func formatFloat(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
+func decimalScale(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if i := strings.IndexAny(raw, "eE"); i >= 0 {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return 0
+		}
+		raw = strconv.FormatFloat(v, 'f', 16, 64)
+	}
+	dot := strings.IndexByte(raw, '.')
+	if dot < 0 {
+		return 0
+	}
+	frac := strings.TrimRight(raw[dot+1:], "0")
+	return len(frac)
+}
+
+func roundToScale(v float64, scale int) float64 {
+	if scale <= 0 {
+		return math.Round(v)
+	}
+	pow := math.Pow10(scale)
+	return math.Round(v*pow) / pow
+}
+
 type orderResponseRaw struct {
 	ClientOrderID string `json:"clientOrderId"`
 	OrderID       int64  `json:"orderId"`
@@ -868,6 +936,18 @@ type orderResponseRaw struct {
 	ExecutedQty   string `json:"executedQty"`
 }
 
+type algoOrderResponseRaw struct {
+	AlgoID       int64  `json:"algoId"`
+	ClientAlgoID string `json:"clientAlgoId"`
+	Symbol       string `json:"symbol"`
+	AlgoStatus   string `json:"algoStatus"`
+	OrderType    string `json:"orderType"`
+	Type         string `json:"type"`
+	Side         string `json:"side"`
+	Quantity     string `json:"quantity"`
+	ExecutedQty  string `json:"executedQty"`
+}
+
 type bookTickerRaw struct {
 	Symbol   string `json:"symbol"`
 	BidPrice string `json:"bidPrice"`
@@ -875,6 +955,38 @@ type bookTickerRaw struct {
 	AskPrice string `json:"askPrice"`
 	AskQty   string `json:"askQty"`
 	Time     int64  `json:"time"`
+}
+
+type premiumIndexRaw struct {
+	Symbol          string `json:"symbol"`
+	MarkPrice       string `json:"markPrice"`
+	IndexPrice      string `json:"indexPrice"`
+	LastFundingRate string `json:"lastFundingRate"`
+	NextFundingTime int64  `json:"nextFundingTime"`
+	Time            int64  `json:"time"`
+}
+
+func (r premiumIndexRaw) premiumIndex() (PremiumIndex, error) {
+	mark, err := strconv.ParseFloat(r.MarkPrice, 64)
+	if err != nil {
+		return PremiumIndex{}, err
+	}
+	index, err := strconv.ParseFloat(r.IndexPrice, 64)
+	if err != nil {
+		return PremiumIndex{}, err
+	}
+	rate, err := strconv.ParseFloat(r.LastFundingRate, 64)
+	if err != nil {
+		return PremiumIndex{}, err
+	}
+	return PremiumIndex{
+		Symbol:          r.Symbol,
+		MarkPrice:       mark,
+		IndexPrice:      index,
+		LastFundingRate: rate,
+		NextFundingTime: time.UnixMilli(r.NextFundingTime).UTC(),
+		Time:            time.UnixMilli(r.Time).UTC(),
+	}, nil
 }
 
 func (r bookTickerRaw) bookTicker() (BookTicker, error) {
@@ -917,6 +1029,22 @@ func (r orderResponseRaw) orderResponse() OrderResponse {
 		Type:          r.Type,
 		Side:          r.Side,
 		AveragePrice:  r.AveragePrice,
+		ExecutedQty:   r.ExecutedQty,
+	}
+}
+
+func (r algoOrderResponseRaw) orderResponse() OrderResponse {
+	orderType := r.OrderType
+	if orderType == "" {
+		orderType = r.Type
+	}
+	return OrderResponse{
+		ClientOrderID: r.ClientAlgoID,
+		OrderID:       r.AlgoID,
+		Symbol:        r.Symbol,
+		Status:        r.AlgoStatus,
+		Type:          orderType,
+		Side:          r.Side,
 		ExecutedQty:   r.ExecutedQty,
 	}
 }
@@ -1067,14 +1195,38 @@ func (c *FuturesClient) CancelAllOpenOrders(ctx context.Context, symbol string) 
 	return c.signedRequest(ctx, http.MethodDelete, "/fapi/v1/allOpenOrders", params, &raw)
 }
 
+// CancelAllAlgoOpenOrders cancels conditional algo orders such as STOP_MARKET
+// and TAKE_PROFIT_MARKET for the symbol.
+func (c *FuturesClient) CancelAllAlgoOpenOrders(ctx context.Context, symbol string) error {
+	params := url.Values{}
+	params.Set("symbol", strings.ToUpper(symbol))
+	var raw map[string]interface{}
+	return c.signedRequest(ctx, http.MethodDelete, "/fapi/v1/algoOpenOrders", params, &raw)
+}
+
+func (c *FuturesClient) CancelAllProtectionOrders(ctx context.Context, symbol string) error {
+	var errs []string
+	if err := c.CancelAllOpenOrders(ctx, symbol); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if err := c.CancelAllAlgoOpenOrders(ctx, symbol); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 // ListedSymbol describes one tradable USD-M perpetual contract with rough
 // 24h liquidity, used by the live-scan command to short-list candidates.
 type ListedSymbol struct {
-	Symbol           string  // e.g. BTCUSDT
-	BaseAsset        string  // e.g. BTC
-	QuoteVolumeUSDT  float64 // 24h quote volume in USDT
-	LastPrice        float64
-	PriceChangePct   float64 // 24h percent change
+	Symbol          string  // e.g. BTCUSDT
+	BaseAsset       string  // e.g. BTC
+	Volume          float64 // 24h base-asset volume
+	QuoteVolumeUSDT float64 // 24h quote volume in USDT
+	LastPrice       float64
+	PriceChangePct  float64 // 24h percent change
 }
 
 // ListUSDTPerpetuals returns the set of USD-M PERPETUAL contracts in TRADING
@@ -1113,6 +1265,7 @@ func (c *FuturesClient) ListUSDTPerpetuals(ctx context.Context, minQuoteVolume f
 		Symbol             string `json:"symbol"`
 		LastPrice          string `json:"lastPrice"`
 		PriceChangePercent string `json:"priceChangePercent"`
+		Volume             string `json:"volume"`
 		QuoteVolume        string `json:"quoteVolume"`
 	}
 	if err := c.publicGET(ctx, "/fapi/v1/ticker/24hr", url.Values{}, &tickerRaw); err != nil {
@@ -1124,6 +1277,7 @@ func (c *FuturesClient) ListUSDTPerpetuals(ctx context.Context, minQuoteVolume f
 		if !ok {
 			continue
 		}
+		vol, _ := strconv.ParseFloat(t.Volume, 64)
 		qv, _ := strconv.ParseFloat(t.QuoteVolume, 64)
 		if qv < minQuoteVolume {
 			continue
@@ -1133,6 +1287,7 @@ func (c *FuturesClient) ListUSDTPerpetuals(ctx context.Context, minQuoteVolume f
 		out = append(out, ListedSymbol{
 			Symbol:          strings.ToUpper(t.Symbol),
 			BaseAsset:       meta.base,
+			Volume:          vol,
 			QuoteVolumeUSDT: qv,
 			LastPrice:       lp,
 			PriceChangePct:  pcp,

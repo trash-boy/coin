@@ -25,18 +25,26 @@ import (
 type xsmomLiveFlags struct {
 	xsmomFlags
 
-	dryRun           bool
-	anchorWeekday    int     // 0=Sunday..6=Saturday; rebalance only when (today.Weekday()) == anchor && (today-genesis).days%hold==0
-	checkInterval    time.Duration
-	maxSymbolFracEq  float64 // single-symbol notional cap as fraction of equity
-	maxGrossFracEq   float64 // total gross notional cap as fraction of equity
+	dryRun            bool
+	anchorWeekday     int // 0=Sunday..6=Saturday; rebalance only when (today.Weekday()) == anchor && (today-genesis).days%hold==0
+	checkInterval     time.Duration
+	maxSymbolFracEq   float64 // single-symbol notional cap as fraction of equity
+	maxGrossFracEq    float64 // total gross notional cap as fraction of equity
 	maxBasketTurnover float64 // 0..1; if > this, alert and skip
-	resizeThreshold  float64 // re-use 5% by default; override here
-	flipDelay        time.Duration
-	logFile          string
-	useAccountEquity bool // if true, fetch USDT MarginBalance and override -equity
-	once             bool // run one rebalance check immediately and exit
-	leverageInt      int  // exchange leverage to set on each symbol (0 = skip)
+	resizeThreshold   float64 // re-use 5% by default; override here
+	flipDelay         time.Duration
+	requestDelay      time.Duration
+	stopLossPct       float64
+	takeProfitPct     float64
+	trailActivation   float64
+	trailingStopPct   float64
+	maxLongFunding    float64
+	maxShortFunding   float64
+	logFile           string
+	stateFile         string
+	useAccountEquity  bool // if true, fetch USDT MarginBalance and override -equity
+	once              bool // run one rebalance check immediately and exit
+	leverageInt       int  // exchange leverage to set on each symbol (0 = skip)
 }
 
 func xsmomLiveFlagSet(name string) (*flag.FlagSet, *xsmomLiveFlags) {
@@ -49,11 +57,11 @@ func xsmomLiveFlagSet(name string) (*flag.FlagSet, *xsmomLiveFlags) {
 	fs2 := flag.NewFlagSet(name, flag.ExitOnError)
 	cfg := xsmom.DefaultConfig()
 	fs2.StringVar(&f.env, "env", "prod", "prod or testnet")
-	fs2.IntVar(&f.top, "top", 100, "top N symbols by 24h quote volume")
+	fs2.IntVar(&f.top, "top", 30, "top N symbols by 24h quote volume")
 	fs2.Float64Var(&f.minListVol, "min-listing-vol-usdt", 5_000_000, "min 24h quote-vol USD entering the candidate list")
 	fs2.IntVar(&f.days, "days", 360, "lookback days for panel construction")
 	fs2.StringVar(&f.interval, "interval", "30m", "source kline interval")
-	fs2.IntVar(&f.maxConcurrent, "max-concurrent", 6, "max concurrent klines fetches")
+	fs2.IntVar(&f.maxConcurrent, "max-concurrent", 1, "max concurrent klines fetches")
 	fs2.Float64Var(&f.equity, "equity", 10000, "equity in USDT (overridden by -use-account-equity)")
 	fs2.IntVar(&f.lookback, "lookback", cfg.LookbackDays, "ranking lookback days")
 	fs2.IntVar(&f.hold, "hold", cfg.HoldDays, "rebalance period in days")
@@ -64,7 +72,7 @@ func xsmomLiveFlagSet(name string) (*flag.FlagSet, *xsmomLiveFlags) {
 	fs2.Float64Var(&f.minQuoteVol, "min-quote-vol-usd", cfg.MinQuoteVolUSD, "rolling 30d quote-vol floor in USD")
 	fs2.Float64Var(&f.feeBps, "fee-bps", cfg.FeeBps, "per-leg taker fee in basis points")
 	fs2.Float64Var(&f.slipBps, "slip-bps", cfg.SlipBps, "per-leg slippage in basis points")
-	fs2.BoolVar(&f.includeFunding, "funding", cfg.IncludeFunding, "include funding cost in signal")
+	fs2.BoolVar(&f.includeFunding, "funding", false, "include funding cost in signal")
 	fs2.BoolVar(&f.symbolsOverride, "symbols-override", false, "treat -symbols as the universe directly")
 	fs2.StringVar(&f.symbols, "symbols", "", "comma-separated symbols when -symbols-override")
 
@@ -76,7 +84,15 @@ func xsmomLiveFlagSet(name string) (*flag.FlagSet, *xsmomLiveFlags) {
 	fs2.Float64Var(&f.maxBasketTurnover, "max-turnover", 0.80, "max fraction of basket replaced; abort above")
 	fs2.Float64Var(&f.resizeThreshold, "resize-threshold", 0.05, "skip resize when |delta|/target <= this")
 	fs2.DurationVar(&f.flipDelay, "flip-delay", 5*time.Second, "wait between close-leg and open-leg orders")
+	fs2.DurationVar(&f.requestDelay, "request-delay", 500*time.Millisecond, "sleep after each symbol data fetch to avoid REST bans")
+	fs2.Float64Var(&f.stopLossPct, "stop-loss-pct", 0.08, "protective stop distance from entry; 0 disables")
+	fs2.Float64Var(&f.takeProfitPct, "take-profit-pct", 0.16, "take-profit distance from entry; 0 disables")
+	fs2.Float64Var(&f.trailActivation, "trail-activation-pct", 0.08, "profit threshold before trailing stop activates; 0 disables")
+	fs2.Float64Var(&f.trailingStopPct, "trailing-stop-pct", 0.06, "trailing stop distance from mark after activation; 0 disables")
+	fs2.Float64Var(&f.maxLongFunding, "max-long-funding", 0.0002, "skip long opens when current funding is above this rate; 0 disables")
+	fs2.Float64Var(&f.maxShortFunding, "max-short-funding", 0.0002, "skip short opens when current funding is below negative this rate; 0 disables")
 	fs2.StringVar(&f.logFile, "log", "~/files/xsmom-trades.log", "JSON-lines log file for executed rebalances")
+	fs2.StringVar(&f.stateFile, "state", "~/files/xsmom-state.json", "state file for xsmom protective stops")
 	fs2.BoolVar(&f.useAccountEquity, "use-account-equity", false, "fetch USDT margin balance and override -equity")
 	fs2.BoolVar(&f.once, "once", false, "run one rebalance check now (ignoring weekday gate) and exit")
 	fs2.IntVar(&f.leverageInt, "exchange-leverage", 3, "exchange-side leverage to set on each symbol; 0 = skip")
@@ -86,12 +102,12 @@ func xsmomLiveFlagSet(name string) (*flag.FlagSet, *xsmomLiveFlags) {
 // runXSMomLive is the always-on runner. It wakes every check-interval,
 // decides whether today is a rebalance day, and if so:
 //
-//	1. fetches current positions from Binance
-//	2. computes target signal + deltas
-//	3. runs risk gates
-//	4. (unless dry-run) sends close-leg market orders, waits flip-delay,
-//	   then sends open-leg market orders
-//	5. appends a JSON-lines record of the rebalance
+//  1. fetches current positions from Binance
+//  2. computes target signal + deltas
+//  3. runs risk gates
+//  4. (unless dry-run) sends close-leg market orders, waits flip-delay,
+//     then sends open-leg market orders
+//  5. appends a JSON-lines record of the rebalance
 func runXSMomLive(args []string) {
 	fs, f := xsmomLiveFlagSet("xsmom-live")
 	_ = fs.Parse(args)
@@ -109,6 +125,10 @@ func runXSMomLive(args []string) {
 	logPath := expandHome(f.logFile)
 	if err := ensureLogDir(logPath); err != nil {
 		log.Fatalf("log dir: %v", err)
+	}
+	statePath := expandHome(f.stateFile)
+	if err := ensureLogDir(statePath); err != nil {
+		log.Fatalf("state dir: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -139,9 +159,14 @@ func runXSMomLive(args []string) {
 		cfg.TopN, cfg.BotN, cfg.LookbackDays, cfg.HoldDays, cfg.Leverage, f.leverageInt)
 	fmt.Printf("risk caps: per-symbol=%.0f%% equity, gross=%.0f%% (equity*lev), max-turnover=%.0f%%\n",
 		f.maxSymbolFracEq*100, f.maxGrossFracEq*100, f.maxBasketTurnover*100)
+	fmt.Printf("protection: stop=%.1f%% take=%.1f%% trail=%.1f%% after %.1f%%; funding caps long<=%.4f%% short>=-%.4f%%\n",
+		f.stopLossPct*100, f.takeProfitPct*100, f.trailingStopPct*100, f.trailActivation*100,
+		f.maxLongFunding*100, f.maxShortFunding*100)
 	fmt.Printf("log: %s\n", logPath)
+	fmt.Printf("state: %s\n", statePath)
 
 	if f.once {
+		manageXSMomProtections(ctx, client, f, statePath)
 		_ = runOneRebalance(ctx, client, cfg, f, logPath, true)
 		return
 	}
@@ -151,6 +176,7 @@ func runXSMomLive(args []string) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
+		manageXSMomProtections(ctx, client, f, statePath)
 		now := time.Now().UTC()
 		if shouldRebalance(now, f.anchorWeekday, f.hold, lastRebalanceDay) {
 			if ok := runOneRebalance(ctx, client, cfg, f, logPath, false); ok {
@@ -221,6 +247,7 @@ func runOneRebalance(ctx context.Context, client *binance.FuturesClient, cfg xsm
 		Interval:       f.interval,
 		MaxConcurrent:  f.maxConcurrent,
 		IncludeFunding: f.includeFunding,
+		RequestDelay:   f.requestDelay,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  ABORT: panel: %v\n", err)
@@ -229,6 +256,7 @@ func runOneRebalance(ctx context.Context, client *binance.FuturesClient, cfg xsm
 	if len(failures) > 0 {
 		fmt.Printf("  panel: %d symbols x %d days (%d skipped)\n",
 			len(panel.Symbols), len(panel.Days), len(failures))
+		printXSMomFailures(failures, 12)
 	} else {
 		fmt.Printf("  panel: %d symbols x %d days\n", len(panel.Symbols), len(panel.Days))
 	}
@@ -255,6 +283,7 @@ func runOneRebalance(ctx context.Context, client *binance.FuturesClient, cfg xsm
 	// 5) Order deltas
 	deltas := xsmom.ComputeOrderDeltas(signalSet, current)
 	deltas = filterTinyResizes(deltas, current, f.resizeThreshold)
+	deltas = filterDeltasByCurrentFunding(ctx, client, deltas, f)
 	if len(deltas) == 0 {
 		fmt.Printf("  no order deltas (current matches target within %.0f%% threshold)\n", f.resizeThreshold*100)
 		writeRebalanceLog(logPath, rebalanceRecord{
@@ -296,9 +325,12 @@ func runOneRebalance(ctx context.Context, client *binance.FuturesClient, cfg xsm
 		return true
 	}
 
+	statePath := expandHome(f.stateFile)
+
 	// 8) Execute: closes first, then opens. Flips become close+open.
 	closeOrders, openOrders := splitDeltas(deltas, current)
 	executed := executeOrders(ctx, client, closeOrders, marks, true)
+	updateXSMomStateAfterCloses(statePath, executed)
 	if len(openOrders) > 0 && f.flipDelay > 0 {
 		select {
 		case <-ctx.Done():
@@ -306,12 +338,11 @@ func runOneRebalance(ctx context.Context, client *binance.FuturesClient, cfg xsm
 		case <-time.After(f.flipDelay):
 		}
 	}
-	executed = append(executed, executeOrders(ctx, client, openOrders, marks, false)...)
-
-	// 9) Set exchange leverage on opens (best-effort, idempotent)
 	if f.leverageInt > 0 {
 		setLeverages(ctx, client, openOrders, f.leverageInt)
 	}
+	executed = append(executed, executeOrders(ctx, client, openOrders, marks, false)...)
+	protectXSMomOpens(ctx, client, f, statePath, executed)
 
 	writeRebalanceLog(logPath, rebalanceRecord{
 		Time:     t0,
@@ -322,8 +353,298 @@ func runOneRebalance(ctx context.Context, client *binance.FuturesClient, cfg xsm
 		Executed: executed,
 		Note:     "live rebalance",
 	})
-	fmt.Printf("  done: %d orders executed (%s)\n", len(executed), time.Since(t0).Round(time.Millisecond))
+	okCount, errCount := executionStats(executed)
+	fmt.Printf("  done: %d orders filled/accepted, %d failed/skipped (%s)\n", okCount, errCount, time.Since(t0).Round(time.Millisecond))
 	return true
+}
+
+func printXSMomFailures(failures []xsmom.SymbolFailure, limit int) {
+	if len(failures) == 0 {
+		return
+	}
+	if limit <= 0 || limit > len(failures) {
+		limit = len(failures)
+	}
+	for i := 0; i < limit; i++ {
+		fmt.Printf("    skip %-14s %v\n", failures[i].Symbol, failures[i].Err)
+	}
+	if len(failures) > limit {
+		fmt.Printf("    ... %d more skipped\n", len(failures)-limit)
+	}
+}
+
+func executionStats(executed []executedOrder) (okCount, errCount int) {
+	for _, ex := range executed {
+		if ex.Error != "" || ex.OrderID == 0 {
+			errCount++
+			continue
+		}
+		okCount++
+	}
+	return okCount, errCount
+}
+
+type xsmomProtectState struct {
+	Positions map[string]xsmomProtectedPosition `json:"positions"`
+}
+
+type xsmomProtectedPosition struct {
+	Symbol      string  `json:"symbol"`
+	Side        string  `json:"side"`
+	EntryPrice  float64 `json:"entry_price"`
+	Quantity    float64 `json:"quantity"`
+	StopPrice   float64 `json:"stop_price"`
+	TakeProfit  float64 `json:"take_profit"`
+	HighestMark float64 `json:"highest_mark,omitempty"`
+	LowestMark  float64 `json:"lowest_mark,omitempty"`
+}
+
+func loadXSMomProtectState(path string) xsmomProtectState {
+	st := xsmomProtectState{Positions: map[string]xsmomProtectedPosition{}}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return st
+	}
+	_ = json.Unmarshal(b, &st)
+	if st.Positions == nil {
+		st.Positions = map[string]xsmomProtectedPosition{}
+	}
+	return st
+}
+
+func saveXSMomProtectState(path string, st xsmomProtectState) {
+	b, _ := json.MarshalIndent(st, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err == nil {
+		_ = os.Rename(tmp, path)
+	}
+}
+
+func filterDeltasByCurrentFunding(ctx context.Context, client *binance.FuturesClient, deltas []xsmom.OrderDelta, f *xsmomLiveFlags) []xsmom.OrderDelta {
+	out := make([]xsmom.OrderDelta, 0, len(deltas))
+	for _, d := range deltas {
+		if d.Side == strategy.Flat || (f.maxLongFunding <= 0 && f.maxShortFunding <= 0) {
+			out = append(out, d)
+			continue
+		}
+		pi, err := client.PremiumIndex(ctx, d.Symbol)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN: funding check %s failed: %v; keeping delta\n", d.Symbol, err)
+			out = append(out, d)
+			continue
+		}
+		if d.Side == strategy.Long && f.maxLongFunding > 0 && pi.LastFundingRate > f.maxLongFunding {
+			fmt.Printf("  skip %-12s long funding %.4f%% > %.4f%%\n", d.Symbol, pi.LastFundingRate*100, f.maxLongFunding*100)
+			continue
+		}
+		if d.Side == strategy.Short && f.maxShortFunding > 0 && pi.LastFundingRate < -f.maxShortFunding {
+			fmt.Printf("  skip %-12s short funding %.4f%% < -%.4f%%\n", d.Symbol, pi.LastFundingRate*100, f.maxShortFunding*100)
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func updateXSMomStateAfterCloses(path string, executed []executedOrder) {
+	st := loadXSMomProtectState(path)
+	changed := false
+	for _, ex := range executed {
+		if ex.Error != "" || ex.OrderID == 0 || !ex.ReduceOnly {
+			continue
+		}
+		delete(st.Positions, ex.Symbol)
+		changed = true
+	}
+	if changed {
+		saveXSMomProtectState(path, st)
+	}
+}
+
+func protectXSMomOpens(ctx context.Context, client *binance.FuturesClient, f *xsmomLiveFlags, path string, executed []executedOrder) {
+	if f.stopLossPct <= 0 && f.takeProfitPct <= 0 {
+		return
+	}
+	st := loadXSMomProtectState(path)
+	changed := false
+	for _, ex := range executed {
+		if ex.Error != "" || ex.OrderID == 0 || ex.ReduceOnly || ex.PositionSide == "" {
+			continue
+		}
+		pos, ok := fetchPosition(ctx, client, ex.Symbol, ex.PositionSide)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "  WARN: protection %s position not found after open\n", ex.Symbol)
+			continue
+		}
+		pp, ok := buildProtectedPosition(pos, ex.PositionSide, f)
+		if !ok {
+			continue
+		}
+		if placeXSMomProtection(ctx, client, f, pp) {
+			st.Positions[pp.Symbol] = pp
+			changed = true
+		}
+	}
+	if changed {
+		saveXSMomProtectState(path, st)
+	}
+}
+
+func manageXSMomProtections(ctx context.Context, client *binance.FuturesClient, f *xsmomLiveFlags, path string) {
+	st := loadXSMomProtectState(path)
+	if len(st.Positions) == 0 {
+		return
+	}
+	changed := false
+	for sym, pp := range st.Positions {
+		pos, ok := fetchPosition(ctx, client, sym, pp.Side)
+		if !ok {
+			delete(st.Positions, sym)
+			changed = true
+			continue
+		}
+		mark := pos.MarkPrice
+		if mark <= 0 {
+			mark = pp.EntryPrice
+		}
+		next := pp
+		next.Quantity = math.Abs(pos.PositionAmt)
+		next.EntryPrice = pos.EntryPrice
+		if next.Side == "LONG" {
+			if mark > next.HighestMark {
+				next.HighestMark = mark
+			}
+			if f.trailingStopPct > 0 && f.trailActivation > 0 && next.HighestMark >= next.EntryPrice*(1+f.trailActivation) {
+				trail := next.HighestMark * (1 - f.trailingStopPct)
+				if trail > next.StopPrice {
+					next.StopPrice = trail
+				}
+			}
+		}
+		if next.Side == "SHORT" {
+			if next.LowestMark <= 0 || mark < next.LowestMark {
+				next.LowestMark = mark
+			}
+			if f.trailingStopPct > 0 && f.trailActivation > 0 && next.LowestMark <= next.EntryPrice*(1-f.trailActivation) {
+				trail := next.LowestMark * (1 + f.trailingStopPct)
+				if next.StopPrice <= 0 || trail < next.StopPrice {
+					next.StopPrice = trail
+				}
+			}
+		}
+		if next.StopPrice != pp.StopPrice || next.Quantity != pp.Quantity || next.EntryPrice != pp.EntryPrice {
+			if placeXSMomProtection(ctx, client, f, next) {
+				st.Positions[sym] = next
+				changed = true
+			}
+		}
+	}
+	if changed {
+		saveXSMomProtectState(path, st)
+	}
+}
+
+func fetchPosition(ctx context.Context, client *binance.FuturesClient, symbol, positionSide string) (binance.Position, bool) {
+	positions, err := client.Positions(ctx, symbol)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  WARN: Positions %s: %v\n", symbol, err)
+		return binance.Position{}, false
+	}
+	wantLong := strings.EqualFold(positionSide, "LONG")
+	for _, p := range positions {
+		if !strings.EqualFold(p.Symbol, symbol) || math.Abs(p.PositionAmt) <= 0 {
+			continue
+		}
+		if wantLong && p.PositionAmt > 0 {
+			return p, true
+		}
+		if !wantLong && p.PositionAmt < 0 {
+			return p, true
+		}
+	}
+	return binance.Position{}, false
+}
+
+func buildProtectedPosition(pos binance.Position, positionSide string, f *xsmomLiveFlags) (xsmomProtectedPosition, bool) {
+	entry := pos.EntryPrice
+	if entry <= 0 {
+		return xsmomProtectedPosition{}, false
+	}
+	pp := xsmomProtectedPosition{
+		Symbol:     strings.ToUpper(pos.Symbol),
+		Side:       strings.ToUpper(positionSide),
+		EntryPrice: entry,
+		Quantity:   math.Abs(pos.PositionAmt),
+	}
+	if pp.Side == "LONG" {
+		pp.HighestMark = maxFloat(pos.MarkPrice, entry)
+		if f.stopLossPct > 0 {
+			pp.StopPrice = entry * (1 - f.stopLossPct)
+		}
+		if f.takeProfitPct > 0 {
+			pp.TakeProfit = entry * (1 + f.takeProfitPct)
+		}
+	} else {
+		pp.LowestMark = pos.MarkPrice
+		if pp.LowestMark <= 0 {
+			pp.LowestMark = entry
+		}
+		if f.stopLossPct > 0 {
+			pp.StopPrice = entry * (1 + f.stopLossPct)
+		}
+		if f.takeProfitPct > 0 {
+			pp.TakeProfit = entry * (1 - f.takeProfitPct)
+		}
+	}
+	return pp, pp.Quantity > 0
+}
+
+func placeXSMomProtection(ctx context.Context, client *binance.FuturesClient, f *xsmomLiveFlags, pp xsmomProtectedPosition) bool {
+	if f.dryRun {
+		fmt.Printf("  DRY-RUN: protect %s %s qty=%.6f stop=%.8f take=%.8f\n", pp.Symbol, pp.Side, pp.Quantity, pp.StopPrice, pp.TakeProfit)
+		return true
+	}
+	rules, err := client.SymbolRules(ctx, pp.Symbol)
+	if err == nil {
+		pp.Quantity = rules.RoundQuantity(pp.Quantity)
+		pp.StopPrice = rules.RoundPrice(pp.StopPrice)
+		pp.TakeProfit = rules.RoundPrice(pp.TakeProfit)
+	}
+	if pp.Quantity <= 0 {
+		return false
+	}
+	if err := client.CancelAllProtectionOrders(ctx, pp.Symbol); err != nil {
+		fmt.Fprintf(os.Stderr, "  WARN: cancel protection %s: %v\n", pp.Symbol, err)
+		return false
+	}
+	side := "SELL"
+	if pp.Side == "SHORT" {
+		side = "BUY"
+	}
+	ok := true
+	if pp.StopPrice > 0 {
+		if _, err := client.PlaceStopMarketOrderWithPositionSide(ctx, pp.Symbol, side, pp.Quantity, pp.StopPrice, pp.Side, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN: stop protection %s: %v\n", pp.Symbol, err)
+			ok = false
+		}
+	}
+	if pp.TakeProfit > 0 {
+		if _, err := client.PlaceTakeProfitMarketOrderWithPositionSide(ctx, pp.Symbol, side, pp.Quantity, pp.TakeProfit, pp.Side, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN: take-profit protection %s: %v\n", pp.Symbol, err)
+			ok = false
+		}
+	}
+	if ok {
+		fmt.Printf("  protected %s %s qty=%.6f stop=%.8f take=%.8f\n", pp.Symbol, pp.Side, pp.Quantity, pp.StopPrice, pp.TakeProfit)
+	}
+	return ok
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // fetchCurrentXSMomPositions queries /positionRisk for all panel symbols
@@ -480,15 +801,16 @@ func splitDeltas(deltas []xsmom.OrderDelta, current []xsmom.CurrentPosition) (cl
 
 // executedOrder records what actually happened on the exchange for a delta.
 type executedOrder struct {
-	Symbol     string  `json:"symbol"`
-	Side       string  `json:"side"`
-	Qty        float64 `json:"qty"`
-	ReduceOnly bool    `json:"reduceOnly"`
-	OrderID    int64   `json:"orderId"`
-	Status     string  `json:"status"`
-	AvgPrice   string  `json:"avgPrice"`
-	Error      string  `json:"error,omitempty"`
-	Reason     string  `json:"reason"`
+	Symbol       string  `json:"symbol"`
+	Side         string  `json:"side"`
+	Qty          float64 `json:"qty"`
+	ReduceOnly   bool    `json:"reduceOnly"`
+	PositionSide string  `json:"positionSide,omitempty"`
+	OrderID      int64   `json:"orderId"`
+	Status       string  `json:"status"`
+	AvgPrice     string  `json:"avgPrice"`
+	Error        string  `json:"error,omitempty"`
+	Reason       string  `json:"reason"`
 }
 
 // executeOrders converts each delta into a Binance market order. Closes
@@ -515,6 +837,7 @@ func executeOrders(ctx context.Context, client *binance.FuturesClient, deltas []
 
 		var side string
 		var qty float64
+		var positionSide string
 		if isClose || d.Side == strategy.Flat {
 			pos, perr := client.Positions(ctx, d.Symbol)
 			if perr != nil {
@@ -534,9 +857,11 @@ func executeOrders(ctx context.Context, client *binance.FuturesClient, deltas []
 			if amt > 0 {
 				side = "SELL"
 				qty = amt
+				positionSide = "LONG"
 			} else {
 				side = "BUY"
 				qty = -amt
+				positionSide = "SHORT"
 			}
 		} else {
 			if mark <= 0 {
@@ -546,8 +871,10 @@ func executeOrders(ctx context.Context, client *binance.FuturesClient, deltas []
 			qty = d.TargetNotional / mark
 			if d.Side == strategy.Long {
 				side = "BUY"
+				positionSide = "LONG"
 			} else {
 				side = "SELL"
+				positionSide = "SHORT"
 			}
 		}
 
@@ -562,13 +889,14 @@ func executeOrders(ctx context.Context, client *binance.FuturesClient, deltas []
 		}
 
 		reduceOnly := isClose || d.Side == strategy.Flat
-		resp, err := client.PlaceMarketOrder(ctx, d.Symbol, side, qty, reduceOnly)
+		resp, err := client.PlaceMarketOrderWithPositionSide(ctx, d.Symbol, side, qty, reduceOnly, positionSide, "")
 		ex := executedOrder{
-			Symbol:     d.Symbol,
-			Side:       side,
-			Qty:        qty,
-			ReduceOnly: reduceOnly,
-			Reason:     d.Reason,
+			Symbol:       d.Symbol,
+			Side:         side,
+			Qty:          qty,
+			ReduceOnly:   reduceOnly,
+			PositionSide: positionSide,
+			Reason:       d.Reason,
 		}
 		if err != nil {
 			ex.Error = err.Error()
@@ -611,13 +939,13 @@ func setLeverages(ctx context.Context, client *binance.FuturesClient, opens []xs
 
 // rebalanceRecord is one line in the JSON-lines audit log.
 type rebalanceRecord struct {
-	Time     time.Time            `json:"time"`
-	DryRun   bool                 `json:"dryRun"`
-	Equity   float64              `json:"equity,omitempty"`
-	Targets  []xsmom.Target       `json:"targets,omitempty"`
-	Deltas   []xsmom.OrderDelta   `json:"deltas,omitempty"`
-	Executed []executedOrder      `json:"executed,omitempty"`
-	Note     string               `json:"note,omitempty"`
+	Time     time.Time          `json:"time"`
+	DryRun   bool               `json:"dryRun"`
+	Equity   float64            `json:"equity,omitempty"`
+	Targets  []xsmom.Target     `json:"targets,omitempty"`
+	Deltas   []xsmom.OrderDelta `json:"deltas,omitempty"`
+	Executed []executedOrder    `json:"executed,omitempty"`
+	Note     string             `json:"note,omitempty"`
 }
 
 func writeRebalanceLog(path string, rec rebalanceRecord) {

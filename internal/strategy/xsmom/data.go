@@ -26,6 +26,9 @@ type FetchOptions struct {
 	MinSampleBars int
 	// IncludeFunding pulls funding history for each symbol. Default true.
 	IncludeFunding bool
+	// RequestDelay sleeps after each symbol fetch. Use this for live runs to
+	// keep REST request bursts below Binance's rolling limits.
+	RequestDelay time.Duration
 }
 
 // SymbolFailure is returned alongside the panel for any symbol that
@@ -68,7 +71,15 @@ func BuildPanelFromBinance(ctx context.Context, client *binance.FuturesClient, o
 		sem <- struct{}{}
 		go func(idx int, sym string) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() {
+				if opts.RequestDelay > 0 {
+					select {
+					case <-time.After(opts.RequestDelay):
+					case <-ctx.Done():
+					}
+				}
+				<-sem
+			}()
 			candles, err := client.KlinesRange(ctx, sym, opts.Interval, start, end)
 			if err != nil {
 				results[idx] = job{err: fmt.Errorf("klines: %w", err)}

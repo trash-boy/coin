@@ -46,6 +46,8 @@ func main() {
 		runLive(os.Args[2:])
 	case "live-scan":
 		runLiveScan(os.Args[2:])
+	case "kline-ws-cache":
+		runKlineWSCache(os.Args[2:])
 	case "xsmom-backtest":
 		runXSMomBacktest(os.Args[2:])
 	case "xsmom-signal":

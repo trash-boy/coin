@@ -233,7 +233,7 @@ func liveCycle(ctx context.Context, c *binance.FuturesClient, symbol, interval s
 		if cerr != nil {
 			return fmt.Errorf("close: %w", cerr)
 		}
-		_ = c.CancelAllOpenOrders(ctx, symbol)
+		_ = c.CancelAllProtectionOrders(ctx, symbol)
 		state.HasPosition = false
 		state.Side = ""
 		state.Quantity = 0
